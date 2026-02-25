@@ -16,6 +16,8 @@ from rich.table import Table
 
 _log_lock = threading.Lock()
 _token_lock = threading.Lock()
+_state_lock = threading.Lock()
+_retry_counter = 0
 
 # ─── Константы ─────────────────────────────���─────────────────
 LOCAL_PORT = 8080
@@ -61,11 +63,10 @@ def refresh_today_tokens():
     cached_slot = int(today_cache_time) // 300 if today_cache_time else -1
     if current_slot == cached_slot:
         return
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log WHERE DATE(ts) = DATE('now')"
-    ).fetchone()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log WHERE DATE(ts) = DATE('now')"
+        ).fetchone()
     today_input_tokens, today_output_tokens = row[0], row[1]
     today_cache_time = now  # флаг для перерисовки из async-потока
 
@@ -81,175 +82,161 @@ def log_error(msg: str, style: str = "red"):
 
 # ─── База данных ─────────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS providers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            url TEXT NOT NULL,
-            key TEXT NOT NULL,
-            active INTEGER DEFAULT 1
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS token_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            model TEXT DEFAULT '',
-            provider_id INTEGER DEFAULT 0,
-            method TEXT,
-            path TEXT,
-            status INTEGER,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0
-        )
-    """)
-    # миграции
-    for col, default in [("model", "''"), ("provider_id", "0")]:
-        try:
-            conn.execute(f"SELECT {col} FROM token_log LIMIT 1")
-        except sqlite3.OperationalError:
-            conn.execute(f"ALTER TABLE token_log ADD COLUMN {col} TEXT DEFAULT {default}")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                key TEXT NOT NULL,
+                active INTEGER DEFAULT 1
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS token_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                model TEXT DEFAULT '',
+                provider_id INTEGER DEFAULT 0,
+                method TEXT,
+                path TEXT,
+                status INTEGER,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0
+            )
+        """)
+        # миграции
+        for col, default in [("model", "''"), ("provider_id", "0")]:
+            try:
+                conn.execute(f"SELECT {col} FROM token_log LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute(f"ALTER TABLE token_log ADD COLUMN {col} TEXT DEFAULT {default}")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
+        conn.commit()
 
 
 def db_load_providers() -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("SELECT id, name, url, key, active FROM providers ORDER BY id").fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT id, name, url, key, active FROM providers ORDER BY id").fetchall()
     return [{"id": r[0], "name": r[1], "url": r[2], "key": r[3], "active": bool(r[4])} for r in rows]
 
 
 def db_add_provider(name: str, url: str, key: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT INTO providers (name, url, key) VALUES (?,?,?)", (name, url, key))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO providers (name, url, key) VALUES (?,?,?)", (name, url, key))
+        conn.commit()
 
 
 def db_remove_provider(pid: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM providers WHERE id=?", (pid,))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM providers WHERE id=?", (pid,))
+        conn.commit()
 
 
 def db_toggle_provider(pid: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE providers SET active = 1 - active WHERE id=?", (pid,))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE providers SET active = 1 - active WHERE id=?", (pid,))
+        conn.commit()
 
 
 def db_edit_provider(pid: int, name: str, url: str, key: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE providers SET name=?, url=?, key=? WHERE id=?", (name, url, key, pid))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE providers SET name=?, url=?, key=? WHERE id=?", (name, url, key, pid))
+        conn.commit()
 
 
 def db_get_setting(key: str, default: str = "") -> str:
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row[0] if row else default
 
 
 def db_set_setting(key: str, value: str):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
+        conn.commit()
 
 
 def db_load_totals(provider_id: int = None) -> tuple[int, int]:
-    conn = sqlite3.connect(DB_PATH)
-    if provider_id is not None:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log WHERE provider_id=?",
-            (provider_id,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log"
-        ).fetchone()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        if provider_id is not None:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log WHERE provider_id=?",
+                (provider_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log"
+            ).fetchone()
     return row[0], row[1]
 
 
 def db_load_totals_all() -> dict[int, tuple[int, int]]:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT provider_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log GROUP BY provider_id"
-    ).fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT provider_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log GROUP BY provider_id"
+        ).fetchall()
     return {int(r[0]): (r[1], r[2]) for r in rows}
 
 
 def db_load_by_model() -> list[tuple[str, int, int, int]]:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT COALESCE(NULLIF(model,''), 'unknown'),
-               COALESCE(SUM(input_tokens),0),
-               COALESCE(SUM(output_tokens),0),
-               COUNT(*)
-        FROM token_log
-        GROUP BY COALESCE(NULLIF(model,''), 'unknown')
-        ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
-    """).fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT COALESCE(NULLIF(model,''), 'unknown'),
+                   COALESCE(SUM(input_tokens),0),
+                   COALESCE(SUM(output_tokens),0),
+                   COUNT(*)
+            FROM token_log
+            GROUP BY COALESCE(NULLIF(model,''), 'unknown')
+            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
+        """).fetchall()
     return rows
 
 
 def db_load_by_day(limit: int = 7) -> list[tuple[str, int, int, int]]:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT DATE(ts),
-               COALESCE(SUM(input_tokens),0),
-               COALESCE(SUM(output_tokens),0),
-               COUNT(*)
-        FROM token_log
-        WHERE DATE(ts) >= DATE('now', ?)
-        GROUP BY DATE(ts)
-        ORDER BY DATE(ts) DESC
-    """, (f"-{limit} days",)).fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT DATE(ts),
+                   COALESCE(SUM(input_tokens),0),
+                   COALESCE(SUM(output_tokens),0),
+                   COUNT(*)
+            FROM token_log
+            WHERE DATE(ts) >= DATE('now', ?)
+            GROUP BY DATE(ts)
+            ORDER BY DATE(ts) DESC
+        """, (f"-{limit} days",)).fetchall()
     return rows
 
 
 def db_load_by_provider() -> list[tuple[int, str, int, int, int]]:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute("""
-        SELECT t.provider_id,
-               COALESCE(p.name, 'unknown'),
-               COALESCE(SUM(t.input_tokens),0),
-               COALESCE(SUM(t.output_tokens),0),
-               COUNT(*)
-        FROM token_log t
-        LEFT JOIN providers p ON t.provider_id = p.id
-        GROUP BY t.provider_id
-        ORDER BY SUM(t.input_tokens) + SUM(t.output_tokens) DESC
-    """).fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("""
+            SELECT t.provider_id,
+                   COALESCE(p.name, 'unknown'),
+                   COALESCE(SUM(t.input_tokens),0),
+                   COALESCE(SUM(t.output_tokens),0),
+                   COUNT(*)
+            FROM token_log t
+            LEFT JOIN providers p ON t.provider_id = p.id
+            GROUP BY t.provider_id
+            ORDER BY SUM(t.input_tokens) + SUM(t.output_tokens) DESC
+        """).fetchall()
     return rows
 
 
 def db_save(model: str, provider_id: int, method: str, path: str, status: int, inp: int, out: int):
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT INTO token_log (ts,model,provider_id,method,path,status,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?)",
-            (time.strftime("%Y-%m-%d %H:%M:%S"), model, provider_id, method, path, status, inp, out),
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO token_log (ts,model,provider_id,method,path,status,input_tokens,output_tokens) VALUES (?,?,?,?,?,?,?,?)",
+                (time.strftime("%Y-%m-%d %H:%M:%S"), model, provider_id, method, path, status, inp, out),
+            )
+            conn.commit()
     except Exception as e:
         log_error(f"db_save: {e}")
 
@@ -269,36 +256,48 @@ def get_active_providers() -> list[dict]:
 
 def current_provider() -> dict | None:
     """Return current sticky provider without advancing index."""
-    active = get_active_providers()
-    if not active:
-        return None
-    global provider_index
-    provider_index = provider_index % len(active)
-    return active[provider_index]
+    with _state_lock:
+        active = get_active_providers()
+        if not active:
+            return None
+        global provider_index
+        provider_index = provider_index % len(active)
+        return active[provider_index]
 
 
 def advance_provider():
     """Switch to the next provider (called on failure)."""
-    global provider_index
-    provider_index += 1
+    with _state_lock:
+        global provider_index
+        provider_index += 1
 
 
 def next_provider() -> dict | None:
     """Round-robin: return current and advance."""
-    p = current_provider()
-    if p:
-        advance_provider()
-    return p
+    with _state_lock:
+        active = get_active_providers()
+        if not active:
+            return None
+        global provider_index
+        provider_index = provider_index % len(active)
+        p = active[provider_index]
+        provider_index += 1
+        return p
 
 
 def reload_providers():
     global providers
-    providers = db_load_providers()
+    new = db_load_providers()
+    with _state_lock:
+        providers = new
 
 
 # ─── Парсинг токенов ─────────────────────────────────────────
 def extract_tokens(data: dict, ctx: dict):
     global total_input_tokens, total_output_tokens, today_input_tokens, today_output_tokens
+
+    delta_inp = 0
+    delta_out = 0
 
     msg = data.get("message")
     if isinstance(msg, dict):
@@ -307,11 +306,7 @@ def extract_tokens(data: dict, ctx: dict):
             ctx["model"] = model
         usage = msg.get("usage")
         if usage:
-            inp = usage.get("input_tokens", 0)
-            with _token_lock:
-                total_input_tokens += inp
-                today_input_tokens += inp
-            ctx["inp"] += inp
+            delta_inp += usage.get("input_tokens", 0)
 
     model = data.get("model", "")
     if model:
@@ -319,15 +314,17 @@ def extract_tokens(data: dict, ctx: dict):
 
     usage = data.get("usage")
     if usage:
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
+        delta_inp += usage.get("input_tokens", 0)
+        delta_out += usage.get("output_tokens", 0)
+
+    if delta_inp or delta_out:
         with _token_lock:
-            total_input_tokens += inp
-            total_output_tokens += out
-            today_input_tokens += inp
-            today_output_tokens += out
-        ctx["inp"] += inp
-        ctx["out"] += out
+            total_input_tokens += delta_inp
+            total_output_tokens += delta_out
+            today_input_tokens += delta_inp
+            today_output_tokens += delta_out
+        ctx["inp"] += delta_inp
+        ctx["out"] += delta_out
 
 
 def parse_sse_chunk(chunk: bytes, buf: list, ctx: dict):
@@ -372,12 +369,15 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
     retry_id = None
 
     while True:
-        if proxy_mode == "single":
-            prov = next((p for p in active if p["id"] == single_provider_id), None)
+        with _state_lock:
+            _mode = proxy_mode
+            _single_id = single_provider_id
+        if _mode == "single":
+            prov = next((p for p in active if p["id"] == _single_id), None)
             if not prov:
-                log_error(f"Single provider #{single_provider_id} not found or inactive", "yellow")
+                log_error(f"Single provider #{_single_id} not found or inactive", "yellow")
                 return web.Response(status=503, text="Selected provider not available")
-        elif proxy_mode == "sticky":
+        elif _mode == "sticky":
             prov = current_provider()
         else:
             prov = next_provider()
@@ -389,7 +389,7 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         headers["x-api-key"] = prov["key"]
         ctx = {"inp": 0, "out": 0, "model": ""}
 
-        async with client_session.request(method=method, url=target_url, headers=headers, data=body, ssl=True) as resp:
+        async with client_session.request(method=method, url=target_url, headers=headers, data=body, ssl=ssl.create_default_context()) as resp:
             if resp.status >= 400:
                 err_body = await resp.read()
                 err_text = err_body.decode("utf-8", errors="replace")
@@ -408,9 +408,11 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
                     tried = 0
                     if retry_count == 0:
                         retry_start = time.time()
-                        retry_id = id(asyncio.current_task())
                         retry_ts = time.strftime("%H:%M:%S")
                         with _log_lock:
+                            global _retry_counter
+                            _retry_counter += 1
+                            retry_id = _retry_counter
                             error_log.append("")
                             _trim_error_log()
                             active_retries[retry_id] = {
@@ -483,7 +485,7 @@ async def start_server():
     app.router.add_route("*", "/{path_info:.*}", proxy_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", LOCAL_PORT)
+    site = web.TCPSite(runner, "127.0.0.1", LOCAL_PORT)
     await site.start()
 
 
@@ -492,6 +494,8 @@ async def stop_server():
         await runner.cleanup()
     if client_session:
         await client_session.close()
+    with _log_lock:
+        active_retries.clear()
 
 
 def run_proxy_loop():
@@ -617,7 +621,11 @@ def screen_main():
     refresh_today_tokens()
     is_online = loop and loop.is_running()
     status = "[on green] [/on green] [bold green]Online[/bold green]" if is_online else "[on red] [/on red] [bold red]Offline[/bold red]"
-    active = get_active_providers()
+    with _state_lock:
+        _providers = list(providers)
+        _proxy_mode = proxy_mode
+        _single_id = single_provider_id
+    active = [p for p in _providers if p["active"]]
     with _token_lock:
         _today_inp = today_input_tokens
         _today_out = today_output_tokens
@@ -627,20 +635,20 @@ def screen_main():
     _p(f"  [bold magenta]====[/bold magenta] [bold bright_white]KLOD PROXY[/bold bright_white] [bold magenta]====[/bold magenta]")
     _p()
     _p(f"  {status}   [dim]|[/dim]   [bright_blue]http://localhost:{LOCAL_PORT}[/bright_blue]")
-    if proxy_mode == "single":
-        sp = next((p for p in providers if p["id"] == single_provider_id), None)
+    if _proxy_mode == "single":
+        sp = next((p for p in _providers if p["id"] == _single_id), None)
         sp_name = sp["name"] if sp else "?"
         mode_str = f"single [bright_yellow]({sp_name})[/bright_yellow]"
     else:
-        mode_str = proxy_mode
-    _p(f"  [bright_white]{len(active)}[/bright_white] [dim]active providers / {len(providers)} total[/dim]   [dim]mode:[/dim] [bright_white]{mode_str}[/bright_white]")
+        mode_str = _proxy_mode
+    _p(f"  [bright_white]{len(active)}[/bright_white] [dim]active providers / {len(_providers)} total[/dim]   [dim]mode:[/dim] [bright_white]{mode_str}[/bright_white]")
     _p()
     # Provider statuses
-    if providers:
+    if _providers:
         cur = current_provider()
         cur_id = cur["id"] if cur else None
         totals_map = db_load_totals_all()
-        for p in providers:
+        for p in _providers:
             if p["active"]:
                 marker = "[bold bright_green]●[/bold bright_green]"
             else:
@@ -738,6 +746,10 @@ def screen_providers():
             url = read_line("  API URL: ")
             if not url:
                 continue
+            if not url.startswith("http://") and not url.startswith("https://"):
+                console.print("  [red]URL must start with http:// or https://[/red]")
+                press_any()
+                continue
             key = read_line("  API key: ")
             if not key:
                 continue
@@ -761,6 +773,10 @@ def screen_providers():
             console.print()
             name = read_line(f"  Name: ", prefill=old["name"]) or old["name"]
             url = read_line(f"  URL: ", prefill=old["url"]) or old["url"]
+            if not url.startswith("http://") and not url.startswith("https://"):
+                console.print("  [red]URL must start with http:// or https://[/red]")
+                press_any()
+                continue
             key = read_line(f"  Key: ", prefill=old["key"]) or old["key"]
             db_edit_provider(old["id"], name, url, key)
             reload_providers()
@@ -917,8 +933,23 @@ def screen_stats():
         console.print()
         console.print(f"  [bold cyan]API Status[/bold cyan]")
         console.print()
+        console.print(f"  [dim]Fetching API stats...[/dim]")
+        results = {}
+        threads = []
         for p in yunyi_provs:
-            data = fetch_yunyi_stats(p)
+            def _fetch(prov=p):
+                results[prov["id"]] = fetch_yunyi_stats(prov)
+            t = threading.Thread(target=_fetch)
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=15)
+        # Re-render after fetch
+        # Move cursor back over "Fetching..." line
+        sys.stdout.write("\033[A\033[K")
+        sys.stdout.flush()
+        for p in yunyi_provs:
+            data = results.get(p["id"])
             if data:
                 render_yunyi_stats(p, data)
             else:
@@ -937,12 +968,15 @@ def screen_settings():
         console.print()
         console.print(f"  [bold yellow]Settings[/bold yellow]")
         console.print()
-        if proxy_mode == "sticky":
+        with _state_lock:
+            _mode = proxy_mode
+            _single_id = single_provider_id
+        if _mode == "sticky":
             mode_label = "[green]sticky[/green]"
-        elif proxy_mode == "round-robin":
+        elif _mode == "round-robin":
             mode_label = "[cyan]round-robin[/cyan]"
         else:
-            sp = next((p for p in providers if p["id"] == single_provider_id), None)
+            sp = next((p for p in providers if p["id"] == _single_id), None)
             sp_name = sp["name"] if sp else "?"
             mode_label = f"[yellow]single ({sp_name})[/yellow]"
         console.print(f"  [bold bright_cyan](1)[/bold bright_cyan] Port       [bold]{LOCAL_PORT}[/bold]")
@@ -962,11 +996,15 @@ def screen_settings():
             val = read_line("  New port: ")
             if val.isdigit():
                 LOCAL_PORT = int(val)
+                db_set_setting("port", str(LOCAL_PORT))
                 console.print("  [yellow]Restart proxy to apply.[/yellow]")
                 press_any()
         elif ch == "2":
             modes = ["sticky", "round-robin", "single"]
-            cur_idx = modes.index(proxy_mode) if proxy_mode in modes else 0
+            with _state_lock:
+                cur_mode = proxy_mode
+                cur_single = single_provider_id
+            cur_idx = modes.index(cur_mode) if cur_mode in modes else 0
             choice = select_option("Select mode", modes, selected=cur_idx)
             if choice is not None:
                 new_mode = modes[choice]
@@ -979,19 +1017,21 @@ def screen_settings():
                         press_any()
                         continue
                     names = [p["name"] for p in active]
-                    cur_sp = next((i for i, p in enumerate(active) if p["id"] == single_provider_id), 0)
+                    cur_sp = next((i for i, p in enumerate(active) if p["id"] == cur_single), 0)
                     sp_choice = select_option("Select provider", names, selected=cur_sp)
                     if sp_choice is None:
                         continue
-                    single_provider_id = active[sp_choice]["id"]
-                    db_set_setting("single_provider_id", str(single_provider_id))
-                proxy_mode = new_mode
-                db_set_setting("proxy_mode", proxy_mode)
+                    cur_single = active[sp_choice]["id"]
+                    db_set_setting("single_provider_id", str(cur_single))
+                with _state_lock:
+                    proxy_mode = new_mode
+                    single_provider_id = cur_single
+                db_set_setting("proxy_mode", new_mode)
 
 
 # ─── Main ────────────────────────────────────────────────────
 def main():
-    global total_input_tokens, total_output_tokens, screen_dirty, proxy_mode, single_provider_id
+    global total_input_tokens, total_output_tokens, screen_dirty, proxy_mode, single_provider_id, LOCAL_PORT
 
     # Включаем ANSI escape codes на Windows
     if sys.platform == "win32":
@@ -1009,6 +1049,7 @@ def main():
     if proxy_mode not in ("sticky", "round-robin", "single"):
         proxy_mode = "sticky"
     single_provider_id = int(db_get_setting("single_provider_id", "0"))
+    LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
 
     total_input_tokens, total_output_tokens = db_load_totals()
     refresh_today_tokens()
