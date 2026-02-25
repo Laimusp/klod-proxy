@@ -42,6 +42,24 @@ python proxy.py
 2. Go to **Providers** and add your API endpoint (URL + API key)
 3. Point your client to `http://localhost:8080` instead of the real API URL
 
+### Claude Code Setup
+
+Set environment variables before launching Claude Code:
+
+```bash
+set ANTHROPIC_BASE_URL=http://localhost:8080
+set ANTHROPIC_API_KEY=klod
+```
+
+Or in PowerShell:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://localhost:8080"
+$env:ANTHROPIC_API_KEY = "klod"
+```
+
+The API key value can be anything (e.g. `klod`) — the proxy replaces it with the real key from the active provider. The important part is `ANTHROPIC_BASE_URL` pointing to the proxy.
+
 ### TUI Controls
 
 | Key | Action |
