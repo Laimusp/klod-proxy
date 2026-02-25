@@ -23,6 +23,38 @@ _headless = False
 if sys.platform == "win32":
     import msvcrt
 
+    def _kbhit():
+        return msvcrt.kbhit()
+
+    def _getwch():
+        return msvcrt.getwch()
+else:
+    import tty
+    import termios
+    import select
+
+    _orig_termios = None
+
+    def _enable_raw():
+        global _orig_termios
+        if _orig_termios is None:
+            _orig_termios = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+
+    def _restore_term():
+        global _orig_termios
+        if _orig_termios is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _orig_termios)
+            _orig_termios = None
+
+    def _kbhit():
+        _enable_raw()
+        return select.select([sys.stdin], [], [], 0)[0] != []
+
+    def _getwch():
+        _enable_raw()
+        return sys.stdin.read(1)
+
 # ─── Константы ─────────────────────────────���─────────────────
 LOCAL_PORT = 8080
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "klod.db")
@@ -521,10 +553,17 @@ def read_line(prompt: str = "", prefill: str = "") -> str:
         sys.stdout.write(prefill)
         sys.stdout.flush()
     while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getwch()
+        if _kbhit():
+            ch = _getwch()
             if ch in ("\x00", "\xe0"):
-                msvcrt.getwch()  # consume scan code of extended key
+                _getwch()  # consume scan code of extended key (Windows)
+                continue
+            if ch == "\x1b":
+                # consume Linux ESC sequence
+                if _kbhit():
+                    seq = _getwch()
+                    if seq == "[" and _kbhit():
+                        _getwch()
                 continue
             if ch in ("\r", "\n"):
                 print()
@@ -545,9 +584,9 @@ def read_line(prompt: str = "", prefill: str = "") -> str:
 
 
 def press_any():
-    while not msvcrt.kbhit():
+    while not _kbhit():
         time.sleep(0.02)
-    msvcrt.getwch()
+    _getwch()
 
 
 def cls(full: bool = False):
@@ -561,6 +600,8 @@ def cls(full: bool = False):
 def show_cursor():
     sys.stdout.write("\033[?25h")
     sys.stdout.flush()
+    if sys.platform != "win32":
+        _restore_term()
 
 
 def select_option(title: str, options: list[str], selected: int = 0) -> int | None:
@@ -580,20 +621,34 @@ def select_option(title: str, options: list[str], selected: int = 0) -> int | No
         console.print(f"  [dim]↑↓ select   Enter confirm   Esc cancel[/dim]")
 
         while True:
-            if msvcrt.kbhit():
-                ch = msvcrt.getwch()
+            if _kbhit():
+                ch = _getwch()
                 if ch in ("\x00", "\xe0"):
-                    sc = msvcrt.getwch()
-                    if sc == "H":  # up
+                    sc = _getwch()
+                    if sc == "H":  # up (Windows)
                         idx = (idx - 1) % len(options)
                         break
-                    elif sc == "P":  # down
+                    elif sc == "P":  # down (Windows)
                         idx = (idx + 1) % len(options)
                         break
+                elif ch == "\x1b":
+                    # Linux: ESC [ A/B for arrows, bare ESC for Esc key
+                    if _kbhit():
+                        seq = _getwch()
+                        if seq == "[":
+                            code = _getwch()
+                            if code == "A":  # up
+                                idx = (idx - 1) % len(options)
+                                break
+                            elif code == "B":  # down
+                                idx = (idx + 1) % len(options)
+                                break
+                    else:
+                        time.sleep(0.05)
+                        if not _kbhit():
+                            return None  # bare Esc
                 elif ch in ("\r", "\n"):
                     return idx
-                elif ch == "\x1b":  # Esc
-                    return None
                 elif ch == "\x03":
                     raise KeyboardInterrupt
             else:
@@ -699,10 +754,17 @@ def screen_main():
 def wait_key() -> str:
     """Wait for a single keypress, return the character. Ignores extended keys."""
     while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getwch()
+        if _kbhit():
+            ch = _getwch()
             if ch in ("\x00", "\xe0"):
-                msvcrt.getwch()
+                _getwch()
+                continue
+            if ch == "\x1b":
+                # consume Linux ESC sequence
+                if _kbhit():
+                    seq = _getwch()
+                    if seq == "[" and _kbhit():
+                        _getwch()
                 continue
             if ch == "\x03":
                 raise KeyboardInterrupt
@@ -1111,10 +1173,16 @@ def main():
             if active_retries:
                 time.sleep(0.5)
                 screen_main()
-            if msvcrt.kbhit():
-                c = msvcrt.getwch()
+            if _kbhit():
+                c = _getwch()
                 if c in ("\x00", "\xe0"):
-                    msvcrt.getwch()  # consume scan code of extended key
+                    _getwch()  # consume scan code of extended key (Windows)
+                elif c == "\x1b":
+                    # consume Linux ESC sequence
+                    if _kbhit():
+                        seq = _getwch()
+                        if seq == "[" and _kbhit():
+                            _getwch()
                 elif c not in ("\r", "\n"):
                     ch = c
             else:
