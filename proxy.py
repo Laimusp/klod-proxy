@@ -6,9 +6,13 @@ import sqlite3
 import sys
 import time
 import threading
+from io import StringIO
 from aiohttp import web, ClientSession, ClientTimeout
 from rich.console import Console
 from rich.table import Table
+
+_log_lock = threading.Lock()
+_token_lock = threading.Lock()
 
 # ─── Константы ─────────────────────────────���─────────────────
 LOCAL_PORT = 8080
@@ -31,6 +35,17 @@ screen_dirty = False
 today_input_tokens = 0
 today_output_tokens = 0
 today_cache_time = 0
+# Активные ретраи: {retry_id: {"provider": str, "count": int, "start": float, "log_idx": int}}
+active_retries: dict[int, dict] = {}
+client_session: ClientSession = None
+
+
+def _trim_error_log():
+    """Вызывать под _log_lock."""
+    while len(error_log) > MAX_ERRORS:
+        error_log.pop(0)
+        for info in active_retries.values():
+            info["log_idx"] -= 1
 
 
 def refresh_today_tokens():
@@ -53,9 +68,9 @@ def refresh_today_tokens():
 def log_error(msg: str, style: str = "red"):
     global screen_dirty
     ts = time.strftime("%H:%M:%S")
-    error_log.append(f"[{style}][{ts}] {msg}[/{style}]")
-    if len(error_log) > MAX_ERRORS:
-        error_log.pop(0)
+    with _log_lock:
+        error_log.append(f"[{style}][{ts}] {msg}[/{style}]")
+        _trim_error_log()
     screen_dirty = True
 
 
@@ -137,6 +152,15 @@ def db_load_totals(provider_id: int = None) -> tuple[int, int]:
     return row[0], row[1]
 
 
+def db_load_totals_all() -> dict[int, tuple[int, int]]:
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT provider_id, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM token_log GROUP BY provider_id"
+    ).fetchall()
+    conn.close()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
 def db_load_by_model() -> list[tuple[str, int, int, int]]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute("""
@@ -194,8 +218,8 @@ def db_save(model: str, provider_id: int, method: str, path: str, status: int, i
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"db_save: {e}")
 
 
 # ─── Провайдеры ──────────────────────────────────────────────
@@ -231,8 +255,9 @@ def extract_tokens(data: dict, ctx: dict):
         usage = msg.get("usage")
         if usage:
             inp = usage.get("input_tokens", 0)
-            total_input_tokens += inp
-            today_input_tokens += inp
+            with _token_lock:
+                total_input_tokens += inp
+                today_input_tokens += inp
             ctx["inp"] += inp
 
     model = data.get("model", "")
@@ -243,10 +268,11 @@ def extract_tokens(data: dict, ctx: dict):
     if usage:
         inp = usage.get("input_tokens", 0)
         out = usage.get("output_tokens", 0)
-        total_input_tokens += inp
-        total_output_tokens += out
-        today_input_tokens += inp
-        today_output_tokens += out
+        with _token_lock:
+            total_input_tokens += inp
+            total_output_tokens += out
+            today_input_tokens += inp
+            today_output_tokens += out
         ctx["inp"] += inp
         ctx["out"] += out
 
@@ -269,6 +295,7 @@ def parse_sse_chunk(chunk: bytes, buf: list, ctx: dict):
 
 # ─── Прокси ─────────────────────────────────────────────────
 async def proxy_handler(request: web.Request) -> web.StreamResponse:
+    global screen_dirty
     path = request.path
     query = request.query_string
 
@@ -279,7 +306,6 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
     body = await request.read()
     method = request.method
-    timeout = ClientTimeout(total=300, sock_read=300)
 
     while True:
         prov = next_provider()
@@ -293,65 +319,88 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
         retry_count = 0
         retry_start = None
+        retry_id = None
 
-        async with ClientSession(timeout=timeout) as session:
-            while True:
-                async with session.request(method=method, url=target_url, headers=headers, data=body, ssl=True) as resp:
-                    if resp.status >= 400:
-                        err_body = await resp.read()
-                        err_text = err_body.decode("utf-8", errors="replace")
+        while True:
+            async with client_session.request(method=method, url=target_url, headers=headers, data=body, ssl=True) as resp:
+                if resp.status >= 400:
+                    err_body = await resp.read()
+                    err_text = err_body.decode("utf-8", errors="replace")
 
-                        if resp.status == 500 and "no avail" in err_text.lower():
-                            if retry_count == 0:
-                                retry_start = time.time()
-                                log_error(f"{prov['name']}: No available accounts — retrying...", "yellow")
-                            retry_count += 1
-                            await asyncio.sleep(RETRY_DELAY)
-                            continue
+                    if resp.status == 500 and "no avail" in err_text.lower():
+                        if retry_count == 0:
+                            retry_start = time.time()
+                            retry_id = id(asyncio.current_task())
+                            retry_ts = time.strftime("%H:%M:%S")
+                            with _log_lock:
+                                error_log.append("")
+                                _trim_error_log()
+                                active_retries[retry_id] = {
+                                    "provider": prov["name"], "count": 0, "start": retry_start,
+                                    "ts": retry_ts, "log_idx": len(error_log) - 1,
+                                }
+                        retry_count += 1
+                        with _log_lock:
+                            info = active_retries[retry_id]
+                            info["count"] = retry_count
+                            idx = info["log_idx"]
+                            if 0 <= idx < len(error_log):
+                                elapsed = int(time.time() - retry_start)
+                                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {prov['name']}: retrying #{retry_count} ({elapsed}s)[/yellow]"
+                        screen_dirty = True
+                        await asyncio.sleep(RETRY_DELAY)
+                        continue
 
-                        log_error(f"{resp.status} {prov['name']}: {err_text[:80]}")
-                        return web.Response(
-                            status=resp.status,
-                            headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS},
-                            body=err_body,
-                        )
+                    log_error(f"{resp.status} {prov['name']}: {err_text[:80]}")
+                    return web.Response(
+                        status=resp.status,
+                        headers={k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS},
+                        body=err_body,
+                    )
 
-                    # Успех после ретраев
-                    if retry_count > 0:
-                        elapsed = int(time.time() - retry_start)
-                        log_error(f"{prov['name']}: OK after {retry_count} retries ({elapsed}s)", "green")
+                # Успех после ретраев — заменяем строку на месте
+                if retry_count > 0:
+                    elapsed = int(time.time() - retry_start)
+                    with _log_lock:
+                        info = active_retries.pop(retry_id, None)
+                        if info:
+                            idx = info["log_idx"]
+                            if 0 <= idx < len(error_log):
+                                error_log[idx] = f"[green][{info['ts']}] ✓ {prov['name']}: OK after {retry_count} retries ({elapsed}s)[/green]"
+                    screen_dirty = True
 
-                    is_stream = "text/event-stream" in resp.headers.get("Content-Type", "")
-                    resp_headers = {k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}
+                is_stream = "text/event-stream" in resp.headers.get("Content-Type", "")
+                resp_headers = {k: v for k, v in resp.headers.items() if k not in STRIP_RESP_HEADERS}
 
-                    if is_stream:
-                        stream_resp = web.StreamResponse(status=resp.status, headers=resp_headers)
-                        try:
-                            await stream_resp.prepare(request)
-                            sse_buf = []
-                            async for chunk in resp.content.iter_any():
-                                parse_sse_chunk(chunk, sse_buf, ctx)
-                                await stream_resp.write(chunk)
-                            await stream_resp.write_eof()
-                        except (ConnectionResetError, ConnectionError, BrokenPipeError):
-                            pass
-                        if ctx["inp"] or ctx["out"]:
-                            db_save(ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
-                        return stream_resp
-                    else:
-                        resp_body = await resp.read()
-                        try:
-                            extract_tokens(json.loads(resp_body), ctx)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-                        if ctx["inp"] or ctx["out"]:
-                            db_save(ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
-                        return web.Response(status=resp.status, headers=resp_headers, body=resp_body)
+                if is_stream:
+                    stream_resp = web.StreamResponse(status=resp.status, headers=resp_headers)
+                    try:
+                        await stream_resp.prepare(request)
+                        sse_buf = []
+                        async for chunk in resp.content.iter_any():
+                            parse_sse_chunk(chunk, sse_buf, ctx)
+                            await stream_resp.write(chunk)
+                        await stream_resp.write_eof()
+                    except (ConnectionResetError, ConnectionError, BrokenPipeError):
+                        pass
+                    if ctx["inp"] or ctx["out"]:
+                        await loop.run_in_executor(None, db_save, ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
+                    return stream_resp
+                else:
+                    resp_body = await resp.read()
+                    try:
+                        extract_tokens(json.loads(resp_body), ctx)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    if ctx["inp"] or ctx["out"]:
+                        await loop.run_in_executor(None, db_save, ctx["model"], prov["id"], method, path, resp.status, ctx["inp"], ctx["out"])
+                    return web.Response(status=resp.status, headers=resp_headers, body=resp_body)
 
 
 # ─── Сервер ──────────────────────────────────────────────────
 async def start_server():
-    global runner
+    global runner, client_session
+    client_session = ClientSession(timeout=ClientTimeout(total=300, sock_read=300))
     app = web.Application()
     app.router.add_route("*", "/{path_info:.*}", proxy_handler)
     runner = web.AppRunner(app)
@@ -363,6 +412,8 @@ async def start_server():
 async def stop_server():
     if runner:
         await runner.cleanup()
+    if client_session:
+        await client_session.close()
 
 
 def run_proxy_loop():
@@ -399,31 +450,29 @@ def read_line(prompt: str = "") -> str:
             time.sleep(0.02)
 
 
-def read_key() -> str:
-    while True:
-        if msvcrt.kbhit():
-            ch = msvcrt.getwch()
-            if ch not in ("\r", "\n"):
-                return ch
-        time.sleep(0.05)
-
-
 def press_any():
     while not msvcrt.kbhit():
         time.sleep(0.02)
     msvcrt.getwch()
 
 
-def cls():
-    # Перемещаем курсор в начало экрана без очистки — убирает моргание
-    sys.stdout.write("\033[H\033[J")
+def cls(full: bool = False):
+    if full:
+        sys.stdout.write("\033[?25l\033[H\033[J")
+    else:
+        sys.stdout.write("\033[?25l\033[H")
+    sys.stdout.flush()
+
+
+def show_cursor():
+    sys.stdout.write("\033[?25h")
     sys.stdout.flush()
 
 
 # ─── TUI ─────────────────────────────────────────────────────
 def fmt(n: int) -> str:
     if n >= 1_000_000:
-        return f"{n / 1_000_000:.1f}m"
+        return f"{n / 1_000_000:.1f}M"
     elif n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
@@ -437,34 +486,68 @@ def bar(value: int, max_value: int, width: int = 20) -> str:
 
 
 def screen_main():
-    cls()
+    buf = StringIO()
+    bcon = Console(file=buf, highlight=False, markup=True, width=console.width, force_terminal=True, color_system="truecolor")
+
+    def _p(text: str = ""):
+        bcon.print(text, end="")
+        buf.write("\033[K\n")
+
     refresh_today_tokens()
-    status = "[bold green]Online[/bold green]" if loop and loop.is_running() else "[bold red]Offline[/bold red]"
+    is_online = loop and loop.is_running()
+    status = "[on green] [/on green] [bold green]Online[/bold green]" if is_online else "[on red] [/on red] [bold red]Offline[/bold red]"
     active = get_active_providers()
-    today_total = today_input_tokens + today_output_tokens
-    console.print()
-    console.print(f"  [bold cyan]Status[/bold cyan]   {status}")
-    console.print(f"  [dim]Listen[/dim]     http://localhost:{LOCAL_PORT}")
-    console.print(f"  [dim]Providers[/dim]  {len(active)} active [dim]/ {len(providers)} total[/dim]")
-    console.print(f"  [dim]Today[/dim]      [cyan]{fmt(today_input_tokens)}[/cyan] in  [green]{fmt(today_output_tokens)}[/green] out  [yellow]{fmt(today_total)}[/yellow] total")
-    console.print()
-    if error_log:
-        console.print(f"  [dim]── Log ──[/dim]")
-        for line in error_log[-10:]:
-            console.print(f"  {line}")
-        console.print()
-    console.print(f"  [dim]1[/dim] Providers   [dim]2[/dim] Stats   [dim]3[/dim] Settings   [dim]0[/dim] Clear log")
-    console.print()
+    with _token_lock:
+        _today_inp = today_input_tokens
+        _today_out = today_output_tokens
+    today_total = _today_inp + _today_out
+
+    _p()
+    _p(f"  [bold magenta]====[/bold magenta] [bold bright_white]KLOD PROXY[/bold bright_white] [bold magenta]====[/bold magenta]")
+    _p()
+    _p(f"  {status}   [dim]|[/dim]   [bright_blue]http://localhost:{LOCAL_PORT}[/bright_blue]")
+    _p(f"  [bright_white]{len(active)}[/bright_white] [dim]active providers / {len(providers)} total[/dim]")
+    _p()
+    s_inp = fmt(_today_inp).rjust(8)
+    s_out = fmt(_today_out).rjust(8)
+    s_total = fmt(today_total).rjust(8)
+    _p(f"  [bold bright_cyan]IN[/bold bright_cyan]    [bright_cyan]{s_inp}[/bright_cyan]  [dim]|[/dim]  [bold bright_green]OUT[/bold bright_green]  [bright_green]{s_out}[/bright_green]")
+    _p(f"  [bold bright_yellow]TOTAL[/bold bright_yellow] [bright_yellow]{s_total}[/bright_yellow]  [dim]|  today[/dim]")
+    _p()
+    # Обновляем анимацию активных ретраев прямо в error_log
+    with _log_lock:
+        for info in active_retries.values():
+            idx = info["log_idx"]
+            if 0 <= idx < len(error_log):
+                elapsed = int(time.time() - info["start"])
+                dots = "." * ((elapsed % 3) + 1) + " " * (2 - (elapsed % 3))
+                error_log[idx] = f"[yellow][{info['ts']}] ⟳ {info['provider']}: retrying #{info['count']} ({elapsed}s){dots}[/yellow]"
+        log_snapshot = list(error_log[-10:])
+    if log_snapshot:
+        _p(f"  [bold red]── Log ──[/bold red]")
+        for line in log_snapshot:
+            _p(f"  {line}")
+        _p()
+    _p(f"  [dim]{'-' * 46}[/dim]")
+    _p(f"  [bold bright_cyan](1)[/bold bright_cyan] Providers  [dim]|[/dim]  [bold bright_green](2)[/bold bright_green] Stats  [dim]|[/dim]  [bold bright_yellow](3)[/bold bright_yellow] Settings  [dim]|[/dim]  [bold red](0)[/bold red] Clear")
+    _p()
+    buf.write("\033[J")
+
+    # Один write — ноль мерцания
+    sys.stdout.write("\033[?25l\033[H" + buf.getvalue())
+    sys.stdout.flush()
 
 
 def screen_providers():
     while True:
-        cls()
+        cls(full=True)
+        show_cursor()
         reload_providers()
         console.print()
         console.print(f"  [bold cyan]Providers[/bold cyan]")
         console.print()
         if providers:
+            totals_map = db_load_totals_all()
             table = Table(box=None, padding=(0, 2), show_header=True, show_edge=False)
             table.add_column("#", style="dim", width=4)
             table.add_column("Name", style="bold", min_width=15)
@@ -475,7 +558,7 @@ def screen_providers():
             for p in providers:
                 masked = p["key"][:8] + "••••" if len(p["key"]) > 8 else p["key"]
                 st = "[green]ON[/green]" if p["active"] else "[red]OFF[/red]"
-                t_inp, t_out = db_load_totals(p["id"])
+                t_inp, t_out = totals_map.get(p["id"], (0, 0))
                 table.add_row(str(p["id"]), p["name"], p["url"], masked, st, fmt(t_inp + t_out))
             console.print(table)
         else:
@@ -515,7 +598,7 @@ def screen_providers():
 
 
 def screen_stats():
-    cls()
+    cls(full=True)
     console.print()
 
     # По моделям
@@ -586,7 +669,8 @@ def screen_stats():
 def screen_settings():
     global LOCAL_PORT
     while True:
-        cls()
+        cls(full=True)
+        show_cursor()
         console.print()
         console.print(f"  [bold yellow]Settings[/bold yellow]")
         console.print()
@@ -626,15 +710,13 @@ def main():
     while True:
         screen_main()
         ch = None
-        last_slot = int(time.time()) // 300
         while ch is None:
             if screen_dirty:
                 screen_dirty = False
                 screen_main()
-            # Перерисовка на границе 5-минутного слота
-            cur_slot = int(time.time()) // 300
-            if cur_slot != last_slot:
-                last_slot = cur_slot
+            # Анимация ретраев — обновляем каждую секунду
+            if active_retries:
+                time.sleep(0.5)
                 screen_main()
             if msvcrt.kbhit():
                 c = msvcrt.getwch()
@@ -650,14 +732,20 @@ def main():
         elif ch == "3":
             screen_settings()
         elif ch == "0":
-            error_log.clear()
+            with _log_lock:
+                error_log.clear()
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
+        show_cursor()
         console.print("\n  [red]Interrupted.[/red]")
         if loop:
-            asyncio.run_coroutine_threadsafe(stop_server(), loop)
+            future = asyncio.run_coroutine_threadsafe(stop_server(), loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                pass
             loop.call_soon_threadsafe(loop.stop)
