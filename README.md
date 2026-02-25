@@ -5,6 +5,7 @@ Local HTTP proxy for Anthropic Claude API (and compatible providers) with a buil
 Sits between your client (Claude Code, Cursor, etc.) and one or more API providers. Balances requests across providers with round-robin, tracks token usage, and auto-retries on temporary failures — all from a single-file Python script.
 
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
+![Linux](https://img.shields.io/badge/platform-Linux-blue)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-yellow)
 
 ## Features
@@ -13,8 +14,10 @@ Sits between your client (Claude Code, Cursor, etc.) and one or more API provide
 - **Token tracking** — per-provider, per-model, and per-day usage statistics stored in SQLite
 - **Auto-retry** — when a provider returns `HTTP 500` with "no available accounts" (common with shared API pools), the proxy automatically retries every 5 seconds until the request goes through, with live retry counter in the TUI
 - **SSE streaming** — full support for streaming responses with real-time token counting
-- **Terminal UI** — manage providers, view stats, and monitor logs without leaving the terminal
-- **One-command install** — `python install.py` sets up everything and adds `klod` to PATH
+- **Terminal UI** — manage providers, view stats, and monitor logs without leaving the terminal (Windows)
+- **Headless mode** — run on Linux servers without TUI, with stdout logging and graceful shutdown
+- **CLI management** — add, remove, toggle, and list providers from the command line
+- **One-command install** — `python install.py` sets up everything and adds `klod` to PATH (Windows)
 
 ## Quick Start
 
@@ -69,6 +72,45 @@ The API key value can be anything (e.g. `klod`) — the proxy replaces it with t
 | `3` | Settings |
 | `0` | Clear log |
 
+## Linux / Headless
+
+```bash
+pip install -r requirements.txt
+
+# Manage providers via CLI
+python3 proxy.py add my-provider https://api.example.com/v1 sk-xxx
+python3 proxy.py list
+python3 proxy.py toggle 1
+python3 proxy.py rm 1
+
+# Run proxy
+python3 proxy.py --headless
+```
+
+### systemd
+
+```ini
+# /etc/systemd/system/klod-proxy.service
+[Unit]
+Description=Klod Proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/klod-proxy
+ExecStart=/usr/bin/python3 /opt/klod-proxy/proxy.py --headless
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now klod-proxy
+journalctl -u klod-proxy -f
+```
+
 ## How It Works
 
 ```
@@ -86,9 +128,8 @@ The proxy intercepts requests, injects the API key for the selected provider, fo
 
 ## Requirements
 
-- Windows 10/11
 - Python 3.10+
-- `aiohttp`, `rich` (installed automatically by `install.py`)
+- `aiohttp`, `rich` (installed automatically by `install.py` on Windows, or `pip install -r requirements.txt`)
 
 ## License
 

@@ -1,7 +1,7 @@
 import asyncio
 import json
-import msvcrt
 import os
+import signal
 import sqlite3
 import ssl
 import sys
@@ -18,6 +18,10 @@ _log_lock = threading.Lock()
 _token_lock = threading.Lock()
 _state_lock = threading.Lock()
 _retry_counter = 0
+_headless = False
+
+if sys.platform == "win32":
+    import msvcrt
 
 # ─── Константы ─────────────────────────────���─────────────────
 LOCAL_PORT = 8080
@@ -78,6 +82,8 @@ def log_error(msg: str, style: str = "red"):
         error_log.append(f"[{style}][{ts}] {msg}[/{style}]")
         _trim_error_log()
     screen_dirty = True
+    if _headless:
+        print(f"[{ts}] {msg}", flush=True)
 
 
 # ─── База данных ─────────────────────────────────────────────
@@ -485,7 +491,7 @@ async def start_server():
     app.router.add_route("*", "/{path_info:.*}", proxy_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", LOCAL_PORT)
+    site = web.TCPSite(runner, "0.0.0.0", LOCAL_PORT)
     await site.start()
 
 
@@ -1029,6 +1035,43 @@ def screen_settings():
                 db_set_setting("proxy_mode", new_mode)
 
 
+# ─── Headless ─────────────────────────────────────────────────
+def main_headless():
+    global _headless, total_input_tokens, total_output_tokens, proxy_mode, single_provider_id, LOCAL_PORT, loop
+    _headless = True
+
+    init_db()
+    reload_providers()
+    old_sticky = db_get_setting("sticky_mode", "")
+    if old_sticky and not db_get_setting("proxy_mode", ""):
+        db_set_setting("proxy_mode", "sticky" if old_sticky == "1" else "round-robin")
+    proxy_mode = db_get_setting("proxy_mode", "sticky")
+    if proxy_mode not in ("sticky", "round-robin", "single"):
+        proxy_mode = "sticky"
+    single_provider_id = int(db_get_setting("single_provider_id", "0"))
+    LOCAL_PORT = int(db_get_setting("port", str(LOCAL_PORT)))
+    total_input_tokens, total_output_tokens = db_load_totals()
+
+    active = get_active_providers()
+    print(f"Proxy listening on 0.0.0.0:{LOCAL_PORT}  ({len(active)} active providers, mode: {proxy_mode})", flush=True)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def _shutdown(sig, frame):
+        print(f"\nReceived signal {sig}, shutting down...", flush=True)
+        asyncio.run_coroutine_threadsafe(stop_server(), loop)
+        loop.call_soon_threadsafe(loop.stop)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    loop.run_until_complete(start_server())
+    loop.run_forever()
+    loop.close()
+    print("Proxy stopped.", flush=True)
+
+
 # ─── Main ────────────────────────────────────────────────────
 def main():
     global total_input_tokens, total_output_tokens, screen_dirty, proxy_mode, single_provider_id, LOCAL_PORT
@@ -1088,16 +1131,79 @@ def main():
                 error_log.clear()
 
 
+def cli():
+    args = sys.argv[1:]
+    if not args:
+        try:
+            main()
+        except KeyboardInterrupt:
+            show_cursor()
+            console.print("\n  [red]Interrupted.[/red]")
+            if loop:
+                future = asyncio.run_coroutine_threadsafe(stop_server(), loop)
+                try:
+                    future.result(timeout=5)
+                except Exception:
+                    pass
+                loop.call_soon_threadsafe(loop.stop)
+        return
+
+    cmd = args[0]
+
+    if cmd == "--headless":
+        main_headless()
+
+    elif cmd == "add":
+        if len(args) < 4:
+            print("Usage: proxy.py add <name> <url> <key>")
+            sys.exit(1)
+        init_db()
+        name, url, key = args[1], args[2], args[3]
+        if not url.startswith("http://") and not url.startswith("https://"):
+            print("Error: URL must start with http:// or https://")
+            sys.exit(1)
+        db_add_provider(name, url, key)
+        print(f"Added provider: {name}")
+
+    elif cmd == "rm":
+        if len(args) < 2:
+            print("Usage: proxy.py rm <id>")
+            sys.exit(1)
+        init_db()
+        db_remove_provider(int(args[1]))
+        print(f"Removed provider #{args[1]}")
+
+    elif cmd == "toggle":
+        if len(args) < 2:
+            print("Usage: proxy.py toggle <id>")
+            sys.exit(1)
+        init_db()
+        db_toggle_provider(int(args[1]))
+        print(f"Toggled provider #{args[1]}")
+
+    elif cmd == "list":
+        init_db()
+        provs = db_load_providers()
+        if not provs:
+            print("No providers configured.")
+        else:
+            for p in provs:
+                st = "ON" if p["active"] else "OFF"
+                masked = p["key"][:8] + "****" if len(p["key"]) > 8 else p["key"]
+                print(f"  #{p['id']}  {st:3s}  {p['name']}  {p['url']}  {masked}")
+
+    else:
+        print("Usage: proxy.py [--headless | add | rm | toggle | list]")
+        print()
+        print("Commands:")
+        print("  (no args)    Start TUI (Windows)")
+        print("  --headless   Start proxy without TUI")
+        print("  add <name> <url> <key>   Add provider")
+        print("  rm <id>                  Remove provider")
+        print("  toggle <id>              Toggle provider on/off")
+        print("  list                     List providers")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        show_cursor()
-        console.print("\n  [red]Interrupted.[/red]")
-        if loop:
-            future = asyncio.run_coroutine_threadsafe(stop_server(), loop)
-            try:
-                future.result(timeout=5)
-            except Exception:
-                pass
-            loop.call_soon_threadsafe(loop.stop)
+    cli()
