@@ -11,7 +11,7 @@ Sits between your client (Claude Code, Cursor, etc.) and one or more API provide
 
 - **Round-robin load balancing** — distribute requests across multiple API providers
 - **Token tracking** — per-provider, per-model, and per-day usage statistics stored in SQLite
-- **Auto-retry** — automatic retries on "no available accounts" errors with live progress in the TUI
+- **Auto-retry** — when a provider returns `HTTP 500` with "no available accounts" (common with shared API pools), the proxy automatically retries every 5 seconds until the request goes through, with live retry counter in the TUI
 - **SSE streaming** — full support for streaming responses with real-time token counting
 - **Terminal UI** — manage providers, view stats, and monitor logs without leaving the terminal
 - **One-command install** — `python install.py` sets up everything and adds `klod` to PATH
